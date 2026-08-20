@@ -19,7 +19,7 @@
   [![Stats](https://github-stats-extended.vercel.app/api?username=sciencepal)](https://github.com/stats-organization/github-stats-extended)&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; <img src="https://github.com/sciencepal/sciencepal/blob/master/assets/saved.gif" width="195">
   
  
-  ##### I am currently aiming to reach ELO 1800 blitz on chess.com ⚡. Here is an ascii tracker of my 100 previous chess.com blitz games.
+  ##### I am currently aiming to reach ELO 1800 blitz on chess.com 
 
   ```
   # ♟︎ Chess.com Ratings Chart #
