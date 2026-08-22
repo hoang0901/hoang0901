@@ -1,4 +1,4 @@
-name: Build Yantra Safe APK
+name: Build Yantra Safe AI APK
 
 on:
   push:
@@ -98,7 +98,6 @@ jobs:
                       output("Usage: switch", terminal.theme.errorTextColor)
                       return
                   }
-
                   output("Opening Android Home app settings...", terminal.theme.resultTextColor, Typeface.ITALIC)
                   try {
                       terminal.activity.startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
@@ -121,6 +120,504 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
+      - name: Add AI bridge and commands
+        run: |
+          mkdir -p app/src/main/java/com/coderGtm/yantra/ai
+          mkdir -p app/src/main/java/com/coderGtm/yantra/commands/ai
+          mkdir -p app/src/main/java/com/coderGtm/yantra/commands/aiconfig
+
+          cat > app/src/main/java/com/coderGtm/yantra/ai/AiBridge.kt <<'KOTLIN'
+          package com.coderGtm.yantra.ai
+
+          import android.content.SharedPreferences
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.URL
+          import javax.net.ssl.HttpsURLConnection
+
+          data class AiResult(val reply: String, val suggestedCommand: String?)
+
+          object AiBridge {
+              private const val PREF_ENDPOINT = "yantraAiEndpoint"
+              private const val PREF_HISTORY = "yantraAiHistory"
+              private const val MAX_HISTORY_ITEMS = 20
+
+              val allowedCommands = setOf("launch", "search", "switch", "battery", "calc", "help", "weather")
+
+              fun endpoint(preferences: SharedPreferences): String =
+                  preferences.getString(PREF_ENDPOINT, "")?.trim().orEmpty()
+
+              fun setEndpoint(preferences: SharedPreferences, value: String): Boolean {
+                  val endpoint = value.trim()
+                  if (!endpoint.startsWith("https://", ignoreCase = true)) return false
+                  preferences.edit().putString(PREF_ENDPOINT, endpoint).apply()
+                  return true
+              }
+
+              fun clearEndpoint(preferences: SharedPreferences) {
+                  preferences.edit().remove(PREF_ENDPOINT).apply()
+              }
+
+              fun clearHistory(preferences: SharedPreferences) {
+                  preferences.edit().remove(PREF_HISTORY).apply()
+              }
+
+              fun loadHistory(preferences: SharedPreferences): List<Pair<String, String>> {
+                  return try {
+                      val raw = preferences.getString(PREF_HISTORY, "[]") ?: "[]"
+                      val array = JSONArray(raw)
+                      buildList {
+                          for (i in 0 until array.length()) {
+                              val item = array.optJSONObject(i) ?: continue
+                              val role = item.optString("role")
+                              val content = item.optString("content")
+                              if ((role == "user" || role == "assistant") && content.isNotBlank()) {
+                                  add(role to content)
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {
+                      emptyList()
+                  }
+              }
+
+              private fun saveHistory(preferences: SharedPreferences, history: List<Pair<String, String>>) {
+                  val trimmed = history.takeLast(MAX_HISTORY_ITEMS)
+                  val array = JSONArray()
+                  for ((role, content) in trimmed) {
+                      array.put(JSONObject().put("role", role).put("content", content))
+                  }
+                  preferences.edit().putString(PREF_HISTORY, array.toString()).apply()
+              }
+
+              fun ask(preferences: SharedPreferences, prompt: String): AiResult {
+                  val endpoint = endpoint(preferences)
+                  require(endpoint.startsWith("https://", ignoreCase = true)) {
+                      "AI backend is not configured. Use: aiconfig https://your-backend.example/chat"
+                  }
+
+                  val oldHistory = loadHistory(preferences)
+                  val messages = JSONArray()
+                  for ((role, content) in oldHistory.takeLast(12)) {
+                      messages.put(JSONObject().put("role", role).put("content", content))
+                  }
+                  messages.put(JSONObject().put("role", "user").put("content", prompt))
+
+                  val payload = JSONObject()
+                      .put("messages", messages)
+                      .put("client", "yantra-safe")
+                      .put("allowed_commands", JSONArray(allowedCommands.toList()))
+
+                  val connection = URL(endpoint).openConnection() as HttpsURLConnection
+                  connection.requestMethod = "POST"
+                  connection.connectTimeout = 15_000
+                  connection.readTimeout = 45_000
+                  connection.doOutput = true
+                  connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                  connection.setRequestProperty("Accept", "application/json")
+
+                  connection.outputStream.use { stream ->
+                      stream.write(payload.toString().toByteArray(Charsets.UTF_8))
+                  }
+
+                  val status = connection.responseCode
+                  val responseText = (if (status in 200..299) connection.inputStream else connection.errorStream)
+                      ?.bufferedReader(Charsets.UTF_8)
+                      ?.use { it.readText() }
+                      .orEmpty()
+                  connection.disconnect()
+
+                  if (status !in 200..299) {
+                      throw IllegalStateException("AI backend returned HTTP $status")
+                  }
+
+                  val json = JSONObject(responseText)
+                  var reply = json.optString("reply").trim()
+                  if (reply.isBlank()) {
+                      val choices = json.optJSONArray("choices")
+                      val message = choices?.optJSONObject(0)?.optJSONObject("message")
+                      reply = message?.optString("content")?.trim().orEmpty()
+                  }
+                  if (reply.isBlank()) throw IllegalStateException("AI backend returned no reply")
+
+                  val rawCommand = json.optString("command").trim()
+                  val suggestedCommand = rawCommand.takeIf { command ->
+                      val name = command.substringBefore(' ').lowercase()
+                      name in allowedCommands
+                  }
+
+                  saveHistory(preferences, oldHistory + ("user" to prompt) + ("assistant" to reply))
+                  return AiResult(reply, suggestedCommand)
+              }
+          }
+          KOTLIN
+
+          cat > app/src/main/java/com/coderGtm/yantra/commands/ai/Command.kt <<'KOTLIN'
+          package com.coderGtm.yantra.commands.ai
+
+          import android.graphics.Typeface
+          import com.coderGtm.yantra.ai.AiBridge
+          import com.coderGtm.yantra.blueprints.BaseCommand
+          import com.coderGtm.yantra.models.CommandMetadata
+          import com.coderGtm.yantra.terminal.Terminal
+
+          class Command(terminal: Terminal) : BaseCommand(terminal) {
+              override val metadata = CommandMetadata(
+                  name = "ai",
+                  helpTitle = "ai <message>",
+                  description = "Chat with the configured AI backend. Use 'ai' to open the AI panel."
+              )
+
+              override fun execute(command: String) {
+                  val prompt = command.removePrefix("ai").trim()
+                  if (prompt.isBlank()) {
+                      terminal.binding.aiPanelVisible = true
+                      output("AI panel opened. Configure a backend with: aiconfig https://your-backend.example/chat", terminal.theme.resultTextColor)
+                      return
+                  }
+                  if (prompt == "--clear") {
+                      AiBridge.clearHistory(terminal.preferenceObject)
+                      terminal.activity.runOnUiThread { terminal.binding.clearAiMessages() }
+                      output("AI history cleared.", terminal.theme.resultTextColor)
+                      return
+                  }
+
+                  val endpoint = AiBridge.endpoint(terminal.preferenceObject)
+                  if (endpoint.isBlank()) {
+                      val text = "AI backend is not configured. Use: aiconfig https://your-backend.example/chat"
+                      output(text, terminal.theme.warningTextColor)
+                      terminal.activity.runOnUiThread {
+                          terminal.binding.aiPanelVisible = true
+                          terminal.binding.addAiMessage("assistant", text)
+                      }
+                      return
+                  }
+
+                  terminal.activity.runOnUiThread {
+                      terminal.binding.aiPanelVisible = true
+                      terminal.binding.addAiMessage("user", prompt)
+                      terminal.binding.aiBusy = true
+                  }
+                  val outputId = output("AI: thinking...", terminal.theme.resultTextColor, Typeface.ITALIC)
+
+                  Thread {
+                      try {
+                          val result = AiBridge.ask(terminal.preferenceObject, prompt)
+                          terminal.updateOutputItem(outputId, "AI: ${result.reply}", terminal.theme.resultTextColor, null, markdown = true)
+                          terminal.activity.runOnUiThread {
+                              terminal.binding.addAiMessage("assistant", result.reply)
+                              terminal.binding.aiBusy = false
+                          }
+
+                          result.suggestedCommand?.let { suggested ->
+                              terminal.activity.runOnUiThread {
+                                  terminal.binding.addAiMessage("assistant", "Suggested action: $suggested (tap the terminal action to run)")
+                                  terminal.binding.addActionOutput(
+                                      text = "Run AI suggestion: $suggested",
+                                      color = terminal.theme.resultTextColor,
+                                      underlined = true,
+                                      fontSize = 16f,
+                                  ) {
+                                      terminal.handleCommand(suggested)
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          val message = e.message ?: "AI request failed"
+                          terminal.updateOutputItem(outputId, "AI error: $message", terminal.theme.errorTextColor, null)
+                          terminal.activity.runOnUiThread {
+                              terminal.binding.addAiMessage("assistant", "Error: $message")
+                              terminal.binding.aiBusy = false
+                          }
+                      }
+                  }.start()
+              }
+          }
+          KOTLIN
+
+          cat > app/src/main/java/com/coderGtm/yantra/commands/aiconfig/Command.kt <<'KOTLIN'
+          package com.coderGtm.yantra.commands.aiconfig
+
+          import com.coderGtm.yantra.ai.AiBridge
+          import com.coderGtm.yantra.blueprints.BaseCommand
+          import com.coderGtm.yantra.models.CommandMetadata
+          import com.coderGtm.yantra.terminal.Terminal
+
+          class Command(terminal: Terminal) : BaseCommand(terminal) {
+              override val metadata = CommandMetadata(
+                  name = "aiconfig",
+                  helpTitle = "aiconfig <https-endpoint|show|clear>",
+                  description = "Configure the HTTPS AI backend proxy. API keys are never embedded in the APK."
+              )
+
+              override fun execute(command: String) {
+                  val value = command.removePrefix("aiconfig").trim()
+                  when {
+                      value.isBlank() || value.equals("show", true) -> {
+                          val current = AiBridge.endpoint(terminal.preferenceObject)
+                          output(if (current.isBlank()) "AI backend: not configured" else "AI backend: $current")
+                      }
+                      value.equals("clear", true) -> {
+                          AiBridge.clearEndpoint(terminal.preferenceObject)
+                          output("AI backend configuration cleared.")
+                      }
+                      AiBridge.setEndpoint(terminal.preferenceObject, value) -> {
+                          output("AI backend configured over HTTPS.")
+                      }
+                      else -> output("Only HTTPS endpoints are allowed. Example: aiconfig https://example.com/chat", terminal.theme.errorTextColor)
+                  }
+              }
+          }
+          KOTLIN
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/coderGtm/yantra/terminal/Helper.kt')
+          s = p.read_text()
+          old = '"switch" to com.coderGtm.yantra.commands.switch.Command::class.java,'
+          new = old + '\n            "ai" to com.coderGtm.yantra.commands.ai.Command::class.java,\n            "aiconfig" to com.coderGtm.yantra.commands.aiconfig.Command::class.java,'
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f'Expected switch in 2 command maps, found {count}')
+          p.write_text(s.replace(old, new))
+          PY
+
+      - name: Add AI panel to launcher UI
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('app/src/main/java/com/coderGtm/yantra/ui/screens/main/MainActivityUiRefs.kt')
+          s = p.read_text()
+          anchor = '''data class MainSuggestionItem(
+              val id: String = UUID.randomUUID().toString(),
+              val text: String,
+              val color: Int,
+              val fontSize: Float,
+              val typeface: Typeface? = null,
+              val style: Int? = null,
+              val onClick: () -> Unit,
+              val onLongClick: (() -> Unit)? = null,
+          )
+          '''
+          addition = anchor + '''\ndata class AiPanelMessage(\n    val role: String,\n    val content: String,\n)\n'''
+          if anchor not in s:
+              raise SystemExit('MainSuggestionItem anchor not found')
+          s = s.replace(anchor, addition, 1)
+
+          anchor2 = '    val modernPrompt = ComposeModernPromptController()\n\n    var luaInputSession by mutableStateOf<LuaInputSession?>(null)'
+          replacement2 = '''    val modernPrompt = ComposeModernPromptController()\n\n    var aiPanelVisible by mutableStateOf(false)\n    var aiInput by mutableStateOf(TextFieldValue(""))\n    var aiBusy by mutableStateOf(false)\n    val aiMessages = mutableStateListOf<AiPanelMessage>()\n    var aiSubmitHandler: ((String) -> Unit)? = null\n\n    var luaInputSession by mutableStateOf<LuaInputSession?>(null)'''
+          if anchor2 not in s:
+              raise SystemExit('UI field anchor not found')
+          s = s.replace(anchor2, replacement2, 1)
+
+          anchor3 = '    fun clearTerminalOutput() = terminalOutput.removeAllViews()\n'
+          replacement3 = '''    fun clearTerminalOutput() = terminalOutput.removeAllViews()\n\n    fun addAiMessage(role: String, content: String) {\n        aiMessages.add(AiPanelMessage(role, content))\n        while (aiMessages.size > 20) aiMessages.removeAt(0)\n    }\n\n    fun clearAiMessages() {\n        aiMessages.clear()\n    }\n\n    fun submitAiInput() {\n        val prompt = aiInput.text.trim()\n        if (prompt.isBlank() || aiBusy) return\n        aiInput = TextFieldValue("")\n        aiSubmitHandler?.invoke(prompt)\n    }\n'''
+          if anchor3 not in s:
+              raise SystemExit('UI method anchor not found')
+          s = s.replace(anchor3, replacement3, 1)
+          p.write_text(s)
+          PY
+
+          cat > app/src/main/java/com/coderGtm/yantra/ui/components/main/MainActivityOverlayControls.kt <<'KOTLIN'
+          package com.coderGtm.yantra.ui.components.main
+
+          import android.view.View
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.combinedClickable
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.heightIn
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.widthIn
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalLocale
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.coderGtm.yantra.ui.screens.main.ComposeButtonController
+          import com.coderGtm.yantra.ui.screens.main.MainActivityUiRefs
+          import com.coderGtm.yantra.ui.screens.main.MainSuggestionItem
+          import com.coderGtm.yantra.ui.screens.main.toComposeFontStyle
+          import com.coderGtm.yantra.ui.screens.main.toComposeFontWeight
+
+          @Composable
+          internal fun MainActivityOverlayControls(
+              uiRefs: MainActivityUiRefs,
+              modifier: Modifier = Modifier,
+          ) {
+              Box(modifier = modifier) {
+                  Text(
+                      text = "AI",
+                      color = Color.White,
+                      fontSize = 15.sp,
+                      modifier = Modifier
+                          .align(Alignment.TopEnd)
+                          .padding(14.dp)
+                          .background(Color.Black.copy(alpha = 0.55f))
+                          .padding(horizontal = 12.dp, vertical = 7.dp)
+                          .clickable { uiRefs.aiPanelVisible = !uiRefs.aiPanelVisible },
+                  )
+
+                  if (uiRefs.aiPanelVisible) {
+                      Surface(
+                          modifier = Modifier
+                              .align(Alignment.TopCenter)
+                              .padding(top = 52.dp, start = 12.dp, end = 12.dp)
+                              .fillMaxWidth()
+                              .widthIn(max = 620.dp),
+                          shape = MaterialTheme.shapes.medium,
+                          tonalElevation = 8.dp,
+                      ) {
+                          Column(
+                              modifier = Modifier.padding(12.dp),
+                              verticalArrangement = Arrangement.spacedBy(8.dp),
+                          ) {
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.SpaceBetween,
+                                  verticalAlignment = Alignment.CenterVertically,
+                              ) {
+                                  Text("Yantra AI", style = MaterialTheme.typography.titleMedium)
+                                  Text(
+                                      "×",
+                                      fontSize = 24.sp,
+                                      modifier = Modifier.clickable { uiRefs.aiPanelVisible = false },
+                                  )
+                              }
+
+                              Column(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .heightIn(max = 260.dp),
+                                  verticalArrangement = Arrangement.spacedBy(6.dp),
+                              ) {
+                                  if (uiRefs.aiMessages.isEmpty()) {
+                                      Text(
+                                          "Chat AI ngay trên launcher. Gõ aiconfig <HTTPS endpoint> trong terminal để kết nối backend proxy.",
+                                          style = MaterialTheme.typography.bodySmall,
+                                      )
+                                  } else {
+                                      uiRefs.aiMessages.takeLast(8).forEach { message ->
+                                          val who = if (message.role == "user") "You" else "AI"
+                                          Text("$who: ${message.content}", style = MaterialTheme.typography.bodyMedium)
+                                      }
+                                  }
+                              }
+
+                              OutlinedTextField(
+                                  value = uiRefs.aiInput,
+                                  onValueChange = { uiRefs.aiInput = it },
+                                  modifier = Modifier.fillMaxWidth(),
+                                  placeholder = { Text("Ask AI...") },
+                                  enabled = !uiRefs.aiBusy,
+                                  maxLines = 4,
+                              )
+
+                              Row(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.End,
+                              ) {
+                                  Button(
+                                      onClick = uiRefs::submitAiInput,
+                                      enabled = !uiRefs.aiBusy && uiRefs.aiInput.text.isNotBlank(),
+                                  ) {
+                                      Text(if (uiRefs.aiBusy) "Thinking..." else "Send")
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  Row(
+                      modifier = Modifier
+                          .align(Alignment.BottomEnd)
+                          .padding(end = 15.dp, bottom = 50.dp),
+                      horizontalArrangement = Arrangement.spacedBy(5.dp),
+                  ) {
+                      MainActivityArrowButton(controller = uiRefs.upBtn)
+                      MainActivityArrowButton(controller = uiRefs.downBtn)
+                  }
+
+                  if (uiRefs.suggestionsTab.items.isNotEmpty()) {
+                      Row(
+                          modifier = Modifier
+                              .align(Alignment.BottomCenter)
+                              .fillMaxWidth()
+                              .background(Color(uiRefs.suggestionsTab.backgroundColorInt))
+                              .horizontalScroll(rememberScrollState()),
+                      ) {
+                          uiRefs.suggestionsTab.items.forEach { item ->
+                              MainActivitySuggestionChip(item = item)
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun MainActivityArrowButton(controller: ComposeButtonController) {
+              if (controller.visibility != View.VISIBLE) return
+              Text(
+                  text = controller.text,
+                  color = Color(controller.textColorInt),
+                  fontSize = controller.textSize.sp,
+                  modifier = Modifier.combinedClickable(onClick = controller::performClick),
+              )
+          }
+
+          @OptIn(ExperimentalFoundationApi::class)
+          @Composable
+          private fun MainActivitySuggestionChip(item: MainSuggestionItem) {
+              Text(
+                  text = item.text.uppercase(LocalLocale.current.platformLocale),
+                  color = Color(item.color),
+                  fontSize = item.fontSize.sp,
+                  fontFamily = item.typeface?.let { FontFamily(it) },
+                  fontWeight = item.style.toComposeFontWeight(),
+                  fontStyle = item.style.toComposeFontStyle(),
+                  modifier = Modifier
+                      .padding(horizontal = 20.dp, vertical = 15.dp)
+                      .combinedClickable(
+                          onClick = item.onClick,
+                          onLongClick = item.onLongClick,
+                      ),
+              )
+          }
+          KOTLIN
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/coderGtm/yantra/terminal/Terminal.kt')
+          s = p.read_text()
+          import_anchor = 'import com.coderGtm.yantra.BuildConfig\n'
+          if import_anchor not in s:
+              raise SystemExit('Terminal import anchor not found')
+          s = s.replace(import_anchor, import_anchor + 'import com.coderGtm.yantra.ai.AiBridge\n', 1)
+
+          init_anchor = '        aliasList = getAliases(preferenceObject)\n'
+          init_code = '''        aliasList = getAliases(preferenceObject)\n        binding.aiSubmitHandler = { prompt -> handleCommand("ai $prompt") }\n        binding.clearAiMessages()\n        AiBridge.loadHistory(preferenceObject).forEach { (role, content) ->\n            binding.addAiMessage(role, content)\n        }\n'''
+          if init_anchor not in s:
+              raise SystemExit('Terminal initialize anchor not found')
+          s = s.replace(init_anchor, init_code, 1)
+          p.write_text(s)
+          PY
+
       - name: Build free debug APK
         run: |
           chmod +x gradlew
@@ -129,15 +626,15 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Safe-Switch-free-debug.apk
-          sha256sum out/Yantra-10.5.0-Safe-Switch-free-debug.apk | tee out/SHA256.txt
+          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Safe-Switch-AI-free-debug.apk
+          sha256sum out/Yantra-10.5.0-Safe-Switch-AI-free-debug.apk | tee out/SHA256.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: yantra-safe-switch-free-debug-apk
+          name: yantra-safe-switch-ai-free-debug-apk
           path: |
-            out/Yantra-10.5.0-Safe-Switch-free-debug.apk
+            out/Yantra-10.5.0-Safe-Switch-AI-free-debug.apk
             out/SHA256.txt
           if-no-files-found: error
           retention-days: 7
