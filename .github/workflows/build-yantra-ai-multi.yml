@@ -1,4 +1,4 @@
-name: Build Yantra Original Direct App APK
+name: Build Yantra Original Direct App NoLaunch APK
 
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
           sed -i '/^org\.gradle\.java\.home=/d' gradle.properties
           printf 'weatherAPIkey="your-weather-api-key"\nbackupPassword="your-backup-password"\n' > local.properties
 
-      - name: Add switch command
+      - name: Add switch and remove public launch command
         run: |
           mkdir -p app/src/main/java/com/coderGtm/yantra/commands/switch
           cat > app/src/main/java/com/coderGtm/yantra/commands/switch/Command.kt <<'KOTLIN'
@@ -73,12 +73,18 @@ jobs:
           from pathlib import Path
           p = Path('app/src/main/java/com/coderGtm/yantra/terminal/Helper.kt')
           s = p.read_text()
+
           old = '"exit" to com.coderGtm.yantra.commands.exit.Command::class.java,'
           new = old + '\n            "switch" to com.coderGtm.yantra.commands.switch.Command::class.java,'
-          count = s.count(old)
-          if count != 2:
-              raise SystemExit(f'Expected 2 command maps, found {count}')
-          p.write_text(s.replace(old, new))
+          if s.count(old) != 2:
+              raise SystemExit(f'Expected 2 command maps, found {s.count(old)}')
+          s = s.replace(old, new)
+
+          launch_line = '            "launch" to com.coderGtm.yantra.commands.launch.Command::class.java,\n'
+          if s.count(launch_line) != 2:
+              raise SystemExit(f'Expected launch in 2 command maps, found {s.count(launch_line)}')
+          s = s.replace(launch_line, '')
+          p.write_text(s)
           PY
 
       - name: Allow direct app-name launching
@@ -94,10 +100,9 @@ jobs:
           new = '''        else {
             if (command.trim() == "") return
 
-            // If the entire input exactly matches an installed app label,
-            // reuse Yantra's existing launch command internally.
-            // Commands and aliases still have priority because this branch
-            // only runs after normal command resolution fails.
+            // Open an installed app when the full input exactly matches its app name.
+            // The public `launch` command is intentionally removed from commands/help.
+            // Existing commands and aliases keep priority over app names.
             if (::appList.isInitialized) {
                 val requestedAppName = command.trim().lowercase()
                 val hasExactAppMatch = appList.any {
@@ -105,7 +110,8 @@ jobs:
                         it.packageName != activity.packageName
                 }
                 if (hasExactAppMatch) {
-                    getCommandInstance("launch")?.execute("launch ${command.trim()}")
+                    com.coderGtm.yantra.commands.launch.Command(this)
+                        .execute("launch ${command.trim()}")
                     return
                 }
             }
@@ -117,6 +123,16 @@ jobs:
           p.write_text(s.replace(old, new, 1))
           PY
 
+      - name: Verify public launch command removed
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          h = Path('app/src/main/java/com/coderGtm/yantra/terminal/Helper.kt').read_text()
+          if '"launch" to com.coderGtm.yantra.commands.launch.Command::class.java' in h:
+              raise SystemExit('launch command still exposed')
+          print('OK: launch command hidden, internal launch implementation preserved.')
+          PY
+
       - name: Build free debug APK
         run: |
           chmod +x gradlew
@@ -125,15 +141,15 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Original-Switch-DirectApp-free-debug.apk
-          sha256sum out/Yantra-10.5.0-Original-Switch-DirectApp-free-debug.apk | tee out/SHA256.txt
+          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Original-Switch-DirectApp-NoLaunch-free-debug.apk
+          sha256sum out/Yantra-10.5.0-Original-Switch-DirectApp-NoLaunch-free-debug.apk | tee out/SHA256.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: yantra-original-switch-directapp-free-debug-apk
+          name: yantra-original-switch-directapp-nolaunch-free-debug-apk
           path: |
-            out/Yantra-10.5.0-Original-Switch-DirectApp-free-debug.apk
+            out/Yantra-10.5.0-Original-Switch-DirectApp-NoLaunch-free-debug.apk
             out/SHA256.txt
           if-no-files-found: error
           retention-days: 7
