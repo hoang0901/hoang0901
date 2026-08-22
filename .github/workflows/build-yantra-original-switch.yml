@@ -1,4 +1,4 @@
-name: Build Yantra Original Switch APK
+name: Build Yantra Original Switch Direct App APK
 
 on:
   push:
@@ -81,6 +81,45 @@ jobs:
           p.write_text(s.replace(old, new))
           PY
 
+      - name: Allow direct app-name launching
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('app/src/main/java/com/coderGtm/yantra/terminal/Terminal.kt')
+          s = p.read_text()
+
+          old = '''        else {
+            if (command.trim() == "") return
+            // find most similar command and recommend
+'''
+
+          new = '''        else {
+            if (command.trim() == "") return
+
+            // If the full input exactly matches an installed app name,
+            // transparently route it through the existing launch command.
+            // Existing commands and aliases keep priority over app names.
+            if (::appList.isInitialized) {
+                val requestedAppName = command.trim().lowercase()
+                val hasExactAppMatch = appList.any {
+                    it.appName.trim().lowercase() == requestedAppName &&
+                        it.packageName != activity.packageName
+                }
+                if (hasExactAppMatch) {
+                    getCommandInstance("launch")?.execute("launch ${command.trim()}")
+                    return
+                }
+            }
+
+            // find most similar command and recommend
+'''
+
+          if old not in s:
+              raise SystemExit('Terminal unknown-command block anchor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
       - name: Build original free debug APK
         run: |
           chmod +x gradlew
@@ -89,15 +128,15 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Original-Switch-free-debug.apk
-          sha256sum out/Yantra-10.5.0-Original-Switch-free-debug.apk | tee out/SHA256.txt
+          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Original-Switch-DirectApp-free-debug.apk
+          sha256sum out/Yantra-10.5.0-Original-Switch-DirectApp-free-debug.apk | tee out/SHA256.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: yantra-original-switch-free-debug-apk
+          name: yantra-original-switch-directapp-free-debug-apk
           path: |
-            out/Yantra-10.5.0-Original-Switch-free-debug.apk
+            out/Yantra-10.5.0-Original-Switch-DirectApp-free-debug.apk
             out/SHA256.txt
           if-no-files-found: error
           retention-days: 7
