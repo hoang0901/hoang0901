@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt-build-yantra-apk
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
@@ -56,7 +59,6 @@ jobs:
                       output("Usage: switch", terminal.theme.errorTextColor)
                       return
                   }
-
                   output("Opening Android Home app settings...", terminal.theme.resultTextColor, Typeface.ITALIC)
                   try {
                       terminal.activity.startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
