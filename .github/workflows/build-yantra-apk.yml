@@ -1,4 +1,4 @@
-name: Build Yantra APK
+name: Build Yantra Safe APK
 
 on:
   push:
@@ -12,11 +12,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Yantra source
+      - name: Checkout audited Yantra source
         uses: actions/checkout@v4
         with:
           repository: coderGtm/yantra-app-launcher
-          ref: main
+          ref: 7b869692c831270c7220392af64f421c95baf8a5
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -33,6 +33,73 @@ jobs:
           sed -i '/^org\.gradle\.java\.home=/d' gradle.properties
           printf 'weatherAPIkey="your-weather-api-key"\nbackupPassword="your-backup-password"\n' > local.properties
 
+      - name: Harden manifest
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          main = Path('app/src/main/AndroidManifest.xml')
+          s = main.read_text()
+
+          # Remove sensitive optional permissions from the main manifest.
+          for perm in [
+              'android.permission.ACCESS_FINE_LOCATION',
+              'android.permission.ACCESS_COARSE_LOCATION',
+              'android.permission.EXPAND_STATUS_BAR',
+          ]:
+              s = re.sub(r'\s*<uses-permission\s+android:name="' + re.escape(perm) + r'"\s*/>\s*', '\n', s)
+
+          # Safer application defaults.
+          s = s.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+          s = s.replace('android:requestLegacyExternalStorage="true"', 'android:requestLegacyExternalStorage="false"')
+          s = s.replace('android:usesCleartextTraffic="true"', 'android:usesCleartextTraffic="false"')
+
+          # Remove exported WebView deep-link surface.
+          s = re.sub(
+              r'\n\s*<activity\n\s*android:name="\.activities\.WebViewActivity".*?</activity>\n',
+              '\n', s, flags=re.S
+          )
+
+          # Remove Device Admin receiver.
+          s = re.sub(
+              r'\n\s*<receiver\n\s*android:name="\.listeners\.AdminReceiver".*?</receiver>\n',
+              '\n', s, flags=re.S
+          )
+
+          # Remove Accessibility service registration.
+          s = re.sub(
+              r'\n\s*<service\n\s*android:name="\.services\.YantraAccessibilityService".*?</service>\n',
+              '\n', s, flags=re.S
+          )
+
+          main.write_text(s)
+
+          free = Path('app/src/free/AndroidManifest.xml')
+          s = free.read_text()
+          for perm in [
+              'android.permission.QUERY_ALL_PACKAGES',
+              'android.permission.CAMERA',
+              'android.permission.REQUEST_DELETE_PACKAGES',
+              'android.permission.BLUETOOTH',
+              'android.permission.BLUETOOTH_ADMIN',
+              'android.permission.BLUETOOTH_CONNECT',
+              'android.permission.READ_CONTACTS',
+              'android.permission.CALL_PHONE',
+          ]:
+              # Handle both one-line and multiline permission declarations.
+              s = re.sub(r'\s*<uses-permission(?:\s+[^>]*?)?android:name="' + re.escape(perm) + r'"(?:\s+[^>]*?)?/>\s*', '\n', s, flags=re.S)
+
+          # Remove camera hardware requirement too.
+          s = re.sub(r'\s*<uses-feature\s+android:name="android\.hardware\.camera"\s*/>\s*', '\n', s)
+          free.write_text(s)
+          PY
+
+          echo '--- hardened main manifest ---'
+          cat app/src/main/AndroidManifest.xml
+          echo '--- hardened free manifest ---'
+          cat app/src/free/AndroidManifest.xml
+
       - name: Build free debug APK
         run: |
           chmod +x gradlew
@@ -41,12 +108,15 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-free-debug.apk
+          cp app/build/outputs/apk/free/debug/*.apk out/Yantra-10.5.0-Safe-free-debug.apk
+          sha256sum out/Yantra-10.5.0-Safe-free-debug.apk | tee out/SHA256.txt
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: yantra-free-debug-apk
-          path: out/Yantra-10.5.0-free-debug.apk
+          name: yantra-safe-free-debug-apk
+          path: |
+            out/Yantra-10.5.0-Safe-free-debug.apk
+            out/SHA256.txt
           if-no-files-found: error
           retention-days: 7
