@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - chatgpt-build-yantra-apk
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:
