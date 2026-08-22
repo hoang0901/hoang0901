@@ -31,7 +31,7 @@ jobs:
       - name: Prepare CI properties
         run: |
           sed -i '/^org\.gradle\.java\.home=/d' gradle.properties
-          touch local.properties
+          printf 'weatherAPIkey="your-weather-api-key"\nbackupPassword="your-backup-password"\n' > local.properties
 
       - name: Build free debug APK
         run: |
